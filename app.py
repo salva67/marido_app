@@ -5,6 +5,8 @@ e inventario de insumos. Toda la persistencia vive en db.py (SQLite).
 """
 
 import datetime
+import io
+import json
 
 import pandas as pd
 import streamlit as st
@@ -19,6 +21,48 @@ st.set_page_config(
 )
 
 db.init_db()
+
+
+def build_excel(data: dict) -> bytes:
+    """Arma un .xlsx con una hoja por sección (Comidas, Tareas, Compras, Insumos)."""
+    nombres = data["names"]
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        meals = data["meals"]
+        comidas = []
+        for d in range(7):
+            day = meals.get(d) or meals.get(str(d)) or {}
+            comidas.append({
+                "Día": db.DAYS[d],
+                "Desayuno": day.get("breakfast", ""),
+                "Almuerzo": day.get("lunch", ""),
+                "Cena": day.get("dinner", ""),
+            })
+        pd.DataFrame(comidas).to_excel(xl, sheet_name="Comidas", index=False)
+
+        tareas = []
+        for t in data["tasks"]:
+            quien = "Ambos" if t["assignee"] == -1 else nombres[t["assignee"]]
+            tareas.append({
+                "Tarea": t["name"],
+                "Responsable": quien,
+                "Días": ", ".join(db.DAY_SHORT[x] for x in t["days"]),
+                "Hechas esta semana": ", ".join(db.DAY_SHORT[x] for x in t["done_days"]) or "—",
+            })
+        pd.DataFrame(tareas or [{"Tarea": "", "Responsable": "", "Días": "", "Hechas esta semana": ""}]
+                     ).to_excel(xl, sheet_name="Tareas", index=False)
+
+        compras = [{"Producto": s["name"], "Categoría": s["cat"],
+                    "Comprado": "Sí" if s["done"] else "No"} for s in data["shopping"]]
+        pd.DataFrame(compras or [{"Producto": "", "Categoría": "", "Comprado": ""}]
+                     ).to_excel(xl, sheet_name="Compras", index=False)
+
+        insumos = [{"Insumo": s["name"], "Nivel": db.LEVELS.get(s["level"], s["level"])}
+                   for s in data["supplies"]]
+        pd.DataFrame(insumos or [{"Insumo": "", "Nivel": ""}]
+                     ).to_excel(xl, sheet_name="Insumos", index=False)
+    return buf.getvalue()
+
 
 # ---------------------------------------------------------------- estilos
 st.markdown(
@@ -287,6 +331,16 @@ with tab_shop:
                 db.clear_bought()
                 st.rerun()
 
+        pendientes = [s for s in shopping if not s["done"]]
+        if pendientes:
+            txt = "LISTA DE COMPRAS\n\n" + "\n".join(
+                f"[ ] {s['name']}  ({s['cat']})" for s in pendientes
+            )
+            st.download_button(
+                "⬇️ Descargar lista para el super (.txt)",
+                data=txt, file_name="lista-compras.txt", mime="text/plain",
+            )
+
 
 # ================================================================ INSUMOS
 with tab_supp:
@@ -334,8 +388,47 @@ with tab_supp:
                         st.toast(f"{s['name']} → lista de compras", icon="🛒")
                         st.rerun()
 
+st.divider()
+
+with st.expander("💾  Respaldo y descargas — guardá una copia de todo"):
+    st.markdown(
+        '<p class="muted">En Streamlit Cloud los datos pueden borrarse cuando la app se '
+        "reinicia. Descargá un respaldo cada tanto; si perdés los datos, lo volvés a cargar acá.</p>",
+        unsafe_allow_html=True,
+    )
+    data = db.export_all()
+    col1, col2 = st.columns(2)
+    col1.download_button(
+        "⬇️ Descargar todo (Excel)",
+        data=build_excel(data),
+        file_name="tablero-hogar.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    col2.download_button(
+        "⬇️ Descargar respaldo (.json)",
+        data=json.dumps(data, ensure_ascii=False, indent=2),
+        file_name="respaldo-hogar.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    st.markdown("---")
+    st.caption("¿Se reinició la app? Subí tu último respaldo `.json` para recuperar todo:")
+    up = st.file_uploader("Restaurar respaldo", type="json", label_visibility="collapsed")
+    if up is not None:
+        st.warning("Restaurar reemplaza todos los datos actuales por los del archivo.")
+        if st.button("Restaurar ahora", type="primary"):
+            try:
+                payload = json.load(up)
+                db.import_all(payload)
+                st.success("Datos restaurados.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo leer el respaldo: {e}")
+
 st.markdown(
-    '<p class="muted" style="text-align:center;margin-top:28px">'
+    '<p class="muted" style="text-align:center;margin-top:20px">'
     "Hecho para organizar el hogar entre dos. Los datos se guardan automáticamente.</p>",
     unsafe_allow_html=True,
 )
