@@ -150,50 +150,99 @@ with tab_meals:
 
 
 # ================================================================ TAREAS
+def who_label(assignee: int) -> str:
+    return "Ambos" if assignee == -1 else names[assignee]
+
+
 with tab_tasks:
     st.subheader("Limpieza y tareas")
     st.markdown(
-        '<p class="muted">Asigná cada tarea a uno de los dos y marcala al terminar.</p>',
+        '<p class="muted">Cada tarea se agenda a los días de la semana que quieras. '
+        "Arriba ves lo de hoy; abajo, la semana completa.</p>",
         unsafe_allow_html=True,
     )
 
-    with st.form("add_task", clear_on_submit=True):
-        c1, c2, c3 = st.columns([3, 2, 2])
-        t_name = c1.text_input("Tarea", placeholder="Lavar los platos…", label_visibility="collapsed")
-        who = c2.selectbox(
-            "Asignar a", options=[0, 1, -1],
-            format_func=lambda i: "Ambos" if i == -1 else names[i],
-            label_visibility="collapsed",
-        )
-        freq = c3.selectbox(
-            "Frecuencia", ["Diaria", "Semanal", "Mensual"], index=1,
-            label_visibility="collapsed",
-        )
-        if st.form_submit_button("Agregar tarea", type="primary", use_container_width=True):
-            if t_name.strip():
-                db.add_task(t_name.strip(), who, freq)
-                st.rerun()
-
     tasks = db.get_tasks()
-    if not tasks:
-        st.info("Todavía no hay tareas. Agregá la primera arriba.")
-    else:
-        for t in tasks:
-            col_chk, col_meta, col_del = st.columns([6, 3, 1])
-            label = f"~~{t['name']}~~" if t["done"] else t["name"]
-            checked = col_chk.checkbox(label, value=bool(t["done"]), key=f"task_{t['id']}")
-            if checked != bool(t["done"]):
-                db.toggle_task(t["id"])
-                st.rerun()
-            who_lbl = "Ambos" if t["assignee"] == -1 else names[t["assignee"]]
-            col_meta.caption(f"{who_lbl} · {t['freq']}")
-            if col_del.button("🗑", key=f"deltask_{t['id']}", help="Eliminar"):
-                db.delete_task(t["id"])
-                st.rerun()
+    ti = today_index()
 
-        if st.button("Desmarcar todas (nueva semana)"):
-            db.reset_tasks()
+    if tasks:
+        # ---- resumen del marido ocupado: hoy + progreso + reparto ----
+        today_all = [t for t in tasks if ti in t["days"]]
+        today_done = [t for t in today_all if ti in t["done_days"]]
+        week_slots = sum(len(t["days"]) for t in tasks)
+        week_done = sum(len(set(t["done_days"]) & set(t["days"])) for t in tasks)
+
+        m1, m2, m3 = st.columns(3)
+        pend_hoy = len(today_all) - len(today_done)
+        m1.metric("Hoy", f"{len(today_done)}/{len(today_all)}" if today_all else "—",
+                  delta=(f"{pend_hoy} pendientes" if pend_hoy else "todo listo") if today_all else "sin tareas",
+                  delta_color="off")
+        m2.metric("Semana", f"{week_done}/{week_slots}")
+        load_a = sum(len(t["days"]) for t in tasks if t["assignee"] in (0, -1))
+        load_b = sum(len(t["days"]) for t in tasks if t["assignee"] in (1, -1))
+        m3.metric("Reparto", f"{load_a} · {load_b}", help=f"{names[0]} · {names[1]} (tareas por semana)")
+
+        # ---- HOY ----
+        st.markdown(f"#### Hoy te toca ({db.DAYS[ti].lower()})")
+        if not today_all:
+            st.success("Nada agendado para hoy. 🎉")
+        else:
+            for t in today_all:
+                done = ti in t["done_days"]
+                lbl = f"~~{t['name']}~~ · {who_label(t['assignee'])}" if done else f"{t['name']} · {who_label(t['assignee'])}"
+                if st.checkbox(lbl, value=done, key=f"today_{t['id']}") != done:
+                    db.toggle_task_day(t["id"], ti)
+                    st.rerun()
+
+        # ---- SEMANA COMPLETA ----
+        st.markdown("#### Planificación semanal")
+        for d in range(7):
+            day_tasks = [t for t in tasks if d in t["days"]]
+            st.markdown(f"**{'🟢 ' if d == ti else ''}{db.DAYS[d]}{' · hoy' if d == ti else ''}**")
+            if not day_tasks:
+                st.caption("Libre")
+                continue
+            for t in day_tasks:
+                done = d in t["done_days"]
+                lbl = f"~~{t['name']}~~ · {who_label(t['assignee'])}" if done else f"{t['name']} · {who_label(t['assignee'])}"
+                col_chk, col_del = st.columns([10, 1])
+                if col_chk.checkbox(lbl, value=done, key=f"week_{t['id']}_{d}") != done:
+                    db.toggle_task_day(t["id"], d)
+                    st.rerun()
+                # botón eliminar una sola vez por tarea, en su primer día agendado
+                if d == min(t["days"]):
+                    if col_del.button("🗑", key=f"deltask_{t['id']}", help="Eliminar tarea de toda la semana"):
+                        db.delete_task(t["id"])
+                        st.rerun()
+
+        st.divider()
+        if st.button("🔄 Empezar nueva semana", help="Desmarca todas las tareas sin borrarlas"):
+            db.reset_week()
             st.rerun()
+    else:
+        st.info("Todavía no hay tareas. Agregá la primera abajo y elegí en qué días de la semana toca.")
+
+    # ---- ALTA DE TAREA ----
+    with st.expander("➕ Agregar tarea", expanded=not tasks):
+        with st.form("add_task", clear_on_submit=True):
+            t_name = st.text_input("Tarea", placeholder="Sacar la basura…")
+            cA, cB = st.columns(2)
+            who = cA.selectbox("¿Quién la hace?", options=[0, 1, -1], format_func=who_label)
+            every_day = cB.checkbox("Todos los días")
+            day_sel = st.multiselect(
+                "¿Qué días?", options=list(range(7)), format_func=lambda d: db.DAYS[d],
+                help="Elegí uno o varios días. Para algo diario, marcá «Todos los días».",
+                disabled=every_day,
+            )
+            if st.form_submit_button("Agregar tarea", type="primary", use_container_width=True):
+                chosen = list(range(7)) if every_day else day_sel
+                if not t_name.strip():
+                    st.warning("Escribí el nombre de la tarea.")
+                elif not chosen:
+                    st.warning("Elegí al menos un día (o marcá «Todos los días»).")
+                else:
+                    db.add_task(t_name.strip(), who, chosen)
+                    st.rerun()
 
 
 # ================================================================ COMPRAS
