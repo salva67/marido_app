@@ -1,6 +1,9 @@
-__pycache__/
-*.pyc
-hogar.db
-hogar.db-wal
-hogar.db-shm
-.venv/
+[theme]
+primaryColor = "#4A6B52"
+backgroundColor = "#FBFAF6"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#26302A"
+font = "serif"
+
+[server]
+headless = true
