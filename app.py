@@ -95,10 +95,12 @@ def init_db() -> None:
     c = _conn()
     for name, ddl in _DDL.items():
         c.execute(ddl.replace(f"CREATE TABLE {name}", f"CREATE TABLE IF NOT EXISTS {name}"))
+    # Migrar ANTES de crear los índices: una base vieja puede tener tablas sin la
+    # columna `home`, y el índice fallaría. _migrate las recrea con el esquema nuevo.
+    _migrate()
     c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_home ON tasks(home);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_shop_home ON shopping(home);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_supp_home ON supplies(home);")
-    _migrate()
     c.commit()
 
 
