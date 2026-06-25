@@ -9,13 +9,13 @@ import io
 import json
 import os
 import random
+import threading
 import uuid
 
 import pandas as pd
 import psycopg
 import streamlit as st
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
 
 # ===================== CAPA DE DATOS (PostgreSQL) =====================
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -29,36 +29,46 @@ EXPENSE_CATS = ["Supermercado", "Servicios", "Hogar", "Salud", "Ocio", "Otros"]
 
 _ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-_pool: ConnectionPool | None = None
+_local = threading.local()
 
 
 def configure(url: str) -> None:
     """Setea la cadena de conexión (la llama la app desde st.secrets)."""
-    global DATABASE_URL, _pool
+    global DATABASE_URL
     DATABASE_URL = url
-    if _pool is not None:
-        _pool.close()
-        _pool = None
+    c = getattr(_local, "conn", None)
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+        _local.conn = None
 
 
-def _get_pool() -> ConnectionPool:
-    global _pool
-    if _pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("Falta DATABASE_URL (configurá la conexión a Postgres).")
-        _pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5, open=True,
-                               kwargs={"row_factory": dict_row})
-    return _pool
+def _conn() -> psycopg.Connection:
+    """Conexión por hilo, con reconexión automática si se cayó."""
+    c = getattr(_local, "conn", None)
+    if c is not None and not c.closed:
+        return c
+    if not DATABASE_URL:
+        raise RuntimeError("Falta DATABASE_URL (configurá la conexión a Postgres).")
+    _local.conn = psycopg.connect(
+        DATABASE_URL, autocommit=True, row_factory=dict_row, connect_timeout=10
+    )
+    return _local.conn
 
 
 def _run(sql: str, params: tuple = (), fetch: str | None = None):
-    with _get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            if fetch == "one":
-                return cur.fetchone()
-            if fetch == "all":
-                return cur.fetchall()
+    try:
+        cur = _conn().execute(sql, params)
+    except psycopg.OperationalError:
+        # La conexión pudo haberse cerrado (idle/scale-to-zero): reconectar una vez.
+        _local.conn = None
+        cur = _conn().execute(sql, params)
+    if fetch == "one":
+        return cur.fetchone()
+    if fetch == "all":
+        return cur.fetchall()
     return None
 
 
@@ -106,10 +116,9 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_supp_home ON supplies(home)",
         "CREATE INDEX IF NOT EXISTS idx_exp_home ON expenses(home)",
     ]
-    with _get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            for s in stmts:
-                cur.execute(s)
+    with _conn().cursor() as cur:
+        for s in stmts:
+            cur.execute(s)
 
 
 # ---------- hogares ----------
@@ -341,7 +350,14 @@ if not _db_url:
              "Agregá DATABASE_URL en los Secrets de la app (ver README).")
     st.stop()
 configure(_db_url)
-init_db()
+try:
+    init_db()
+except Exception as _e:
+    st.error("No pude conectar a la base de datos.\n\nDetalle técnico: " + str(_e)[:400])
+    st.info("Si usás **Supabase**: la cadena tiene que ser la del **Session pooler** "
+            "(host con `pooler.supabase.com`, puerto **5432**), no la conexión directa, "
+            "y la contraseña debe ser la correcta.")
+    st.stop()
 
 
 def build_excel(data: dict) -> bytes:
