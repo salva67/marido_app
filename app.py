@@ -1,14 +1,18 @@
 """Tablero del hogar — app Streamlit multi-hogar (archivo único, PostgreSQL).
 
 Datos permanentes en Postgres/Supabase. La conexión se toma de los Secrets
-(DATABASE_URL). Todo (datos + interfaz) vive en este único archivo.
+(DATABASE_URL). El acceso se hace con email + PIN para no depender de recordar
+códigos de hogar ni perder el acceso a los datos cargados.
 """
 
 import datetime
+import hashlib
+import hmac
 import io
 import json
 import os
 import random
+import re
 import threading
 import uuid
 
@@ -28,6 +32,7 @@ LEVELS = {"ok": "Bien", "low": "Poco", "out": "Agotado"}
 EXPENSE_CATS = ["Supermercado", "Servicios", "Hogar", "Salud", "Ocio", "Otros"]
 
 _ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 _local = threading.local()
 
@@ -111,10 +116,16 @@ def init_db() -> None:
             amount DOUBLE PRECISION NOT NULL, payer INTEGER NOT NULL,
             category TEXT NOT NULL, shared INTEGER NOT NULL DEFAULT 1,
             date TEXT NOT NULL, created TIMESTAMP NOT NULL DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY, home TEXT NOT NULL,
+            pin_hash TEXT NOT NULL, salt TEXT NOT NULL,
+            created TIMESTAMP NOT NULL DEFAULT NOW(),
+            last_login TIMESTAMP)""",
         "CREATE INDEX IF NOT EXISTS idx_tasks_home ON tasks(home)",
         "CREATE INDEX IF NOT EXISTS idx_shop_home ON shopping(home)",
         "CREATE INDEX IF NOT EXISTS idx_supp_home ON supplies(home)",
         "CREATE INDEX IF NOT EXISTS idx_exp_home ON expenses(home)",
+        "CREATE INDEX IF NOT EXISTS idx_users_home ON users(home)",
     ]
     with _conn().cursor() as cur:
         for s in stmts:
@@ -166,6 +177,115 @@ def set_config(home: str, key: str, value: str) -> None:
 def get_names(home: str) -> list[str]:
     return [get_config(home, "name_a") or "Persona 1",
             get_config(home, "name_b") or "Persona 2"]
+
+
+# ---------- usuarios / login simple ----------
+def normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def valid_email(email: str) -> bool:
+    return bool(_EMAIL_RE.match(normalize_email(email)))
+
+
+def valid_pin(pin: str) -> bool:
+    # PIN o clave corta: simple para uso familiar, pero mínimo 4 caracteres.
+    return len(pin or "") >= 4
+
+
+def _new_salt() -> str:
+    return os.urandom(16).hex()
+
+
+def _hash_pin(pin: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256", str(pin).encode("utf-8"), bytes.fromhex(salt), 160_000
+    ).hex()
+
+
+def user_exists(email: str) -> bool:
+    email = normalize_email(email)
+    return _run("SELECT 1 FROM users WHERE email = %s", (email,), fetch="one") is not None
+
+
+def create_user_home(email: str, pin: str, home_name: str = "") -> str:
+    email = normalize_email(email)
+    if not valid_email(email):
+        raise ValueError("Email inválido.")
+    if not valid_pin(pin):
+        raise ValueError("El PIN tiene que tener al menos 4 caracteres.")
+    if user_exists(email):
+        raise ValueError("Ya existe una cuenta con ese email.")
+    home = create_home(home_name or "Mi hogar")
+    salt = _new_salt()
+    _run(
+        "INSERT INTO users (email, home, pin_hash, salt, last_login) "
+        "VALUES (%s, %s, %s, %s, NOW())",
+        (email, home, _hash_pin(pin, salt), salt),
+    )
+    return home
+
+
+def login_user(email: str, pin: str) -> str | None:
+    email = normalize_email(email)
+    row = _run("SELECT home, pin_hash, salt FROM users WHERE email = %s", (email,), fetch="one")
+    if not row:
+        return None
+    candidate = _hash_pin(pin, row["salt"])
+    if not hmac.compare_digest(candidate, row["pin_hash"]):
+        return None
+    _run("UPDATE users SET last_login = NOW() WHERE email = %s", (email,))
+    return row["home"]
+
+
+def add_user_to_home(email: str, pin: str, home: str) -> str:
+    email = normalize_email(email)
+    if not valid_email(email):
+        raise ValueError("Email inválido.")
+    if not valid_pin(pin):
+        raise ValueError("El PIN tiene que tener al menos 4 caracteres.")
+    existing = _run("SELECT home FROM users WHERE email = %s", (email,), fetch="one")
+    if existing:
+        if existing["home"] == home:
+            return "already_here"
+        raise ValueError("Ese email ya está asociado a otro hogar.")
+    salt = _new_salt()
+    _run(
+        "INSERT INTO users (email, home, pin_hash, salt) VALUES (%s, %s, %s, %s)",
+        (email, home, _hash_pin(pin, salt), salt),
+    )
+    return "created"
+
+
+def list_home_users(home: str) -> list[dict]:
+    return _run(
+        "SELECT email, created, last_login FROM users WHERE home = %s ORDER BY created ASC",
+        (home,), fetch="all"
+    ) or []
+
+
+def move_user_to_existing_home(email: str, pin: str, home: str) -> None:
+    email = normalize_email(email)
+    if not home_exists(home):
+        raise ValueError("No existe un hogar con ese código.")
+    if not user_exists(email):
+        add_user_to_home(email, pin, home)
+    else:
+        # Pedimos el PIN para evitar que cualquiera reasigne un email ajeno.
+        if login_user(email, pin) is None:
+            raise ValueError("El PIN no coincide con ese email.")
+        _run("UPDATE users SET home = %s WHERE email = %s", (home, email))
+
+
+def change_user_pin(email: str, current_pin: str, new_pin: str) -> None:
+    email = normalize_email(email)
+    if login_user(email, current_pin) is None:
+        raise ValueError("El PIN actual no coincide.")
+    if not valid_pin(new_pin):
+        raise ValueError("El PIN nuevo tiene que tener al menos 4 caracteres.")
+    salt = _new_salt()
+    _run("UPDATE users SET pin_hash = %s, salt = %s WHERE email = %s",
+         (_hash_pin(new_pin, salt), salt, email))
 
 
 # ---------- meals ----------
@@ -510,51 +630,87 @@ st.markdown(
 )
 
 
-# ---------------------------------------------------------------- gate de hogar
+# ---------------------------------------------------------------- login por email + PIN
 def render_gate() -> None:
     st.markdown(
         """
         <div class="home-head">
           <div class="eyebrow">Tablero del hogar</div>
-          <h1>Organizá tu casa en pareja o familia</h1>
-          <div class="couple">Comidas · tareas · compras · insumos — todo en un lugar.</div>
+          <h1>Entrá con tu email y PIN</h1>
+          <div class="couple">Tus datos quedan asociados a tu usuario y se guardan en la base permanente.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.subheader("Entrá a tu hogar")
-    tab_new, tab_join = st.tabs(["✨ Crear un hogar nuevo", "🔑 Entrar con código"])
 
-    with tab_new:
-        st.markdown('<p class="muted">Creá un espacio para tu casa y compartí el código '
-                    "con quienes vivan con vos.</p>", unsafe_allow_html=True)
-        nm = st.text_input("Nombre del hogar (opcional)", placeholder="Casa de los López")
-        if st.button("Crear hogar", type="primary", use_container_width=True):
-            code = create_home(nm)
-            st.session_state["home"] = code
-            st.query_params["home"] = code
-            st.rerun()
+    tab_login, tab_new, tab_recover = st.tabs([
+        "🔐 Entrar", "✨ Crear cuenta", "🔁 Recuperar código viejo"
+    ])
 
-    with tab_join:
-        st.markdown('<p class="muted">Pedí el código a quien creó el hogar (6 caracteres).</p>',
-                    unsafe_allow_html=True)
-        code_in = st.text_input("Código del hogar", max_chars=6, placeholder="Ej: ZEKZJ2")
-        if st.button("Entrar", type="primary", use_container_width=True):
-            code = code_in.strip().upper()
-            if home_exists(code):
-                st.session_state["home"] = code
-                st.query_params["home"] = code
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", placeholder="tuemail@gmail.com")
+            pin = st.text_input("PIN / clave", type="password", placeholder="Mínimo 4 caracteres")
+            submitted = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+        if submitted:
+            home_code = login_user(email, pin)
+            if home_code and home_exists(home_code):
+                st.session_state["user_email"] = normalize_email(email)
+                st.session_state["home"] = home_code
                 st.rerun()
             else:
-                st.error("No existe un hogar con ese código. Revisalo o creá uno nuevo.")
+                st.error("Email o PIN incorrecto.")
+
+    with tab_new:
+        st.markdown('<p class="muted">Creá tu usuario. La próxima vez entrás con el mismo email y PIN.</p>',
+                    unsafe_allow_html=True)
+        with st.form("create_account_form"):
+            email = st.text_input("Email", key="new_email", placeholder="tuemail@gmail.com")
+            home_name_input = st.text_input("Nombre del hogar", placeholder="Casa de los López")
+            c1, c2 = st.columns(2)
+            pin = c1.text_input("PIN / clave", type="password", key="new_pin")
+            pin2 = c2.text_input("Repetir PIN", type="password", key="new_pin2")
+            submitted = st.form_submit_button("Crear cuenta", type="primary", use_container_width=True)
+        if submitted:
+            try:
+                if pin != pin2:
+                    st.error("Los PIN no coinciden.")
+                else:
+                    home_code = create_user_home(email, pin, home_name_input)
+                    st.session_state["user_email"] = normalize_email(email)
+                    st.session_state["home"] = home_code
+                    st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    with tab_recover:
+        st.markdown(
+            '<p class="muted">Usá esto sólo si ya tenías un hogar creado con código. '
+            'Vincula ese hogar a tu email para no depender más del código.</p>',
+            unsafe_allow_html=True,
+        )
+        with st.form("recover_home_form"):
+            email = st.text_input("Email", key="recover_email", placeholder="tuemail@gmail.com")
+            pin = st.text_input("PIN de tu cuenta", type="password", key="recover_pin")
+            old_code = st.text_input("Código viejo del hogar", max_chars=6, placeholder="Ej: ZEKZJ2")
+            submitted = st.form_submit_button("Vincular código a mi email", type="primary", use_container_width=True)
+        if submitted:
+            try:
+                move_user_to_existing_home(email, pin, old_code.strip().upper())
+                st.session_state["user_email"] = normalize_email(email)
+                st.session_state["home"] = old_code.strip().upper()
+                st.success("Hogar vinculado a tu email.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 
 
 def resolve_home() -> str | None:
-    qp_home = st.query_params.get("home")
-    if qp_home and home_exists(qp_home):
-        st.session_state["home"] = qp_home
-        return qp_home
-    return st.session_state.get("home")
+    email = st.session_state.get("user_email")
+    home_code = st.session_state.get("home")
+    if email and home_code and home_exists(home_code):
+        return home_code
+    return None
 
 
 home = resolve_home()
@@ -562,6 +718,7 @@ if not home:
     render_gate()
     st.stop()
 
+current_email = st.session_state.get("user_email", "")
 names = get_names(home)
 home_name = get_home_name(home)
 
@@ -569,7 +726,7 @@ home_name = get_home_name(home)
 st.markdown(
     f"""
     <div class="home-head">
-      <div class="eyebrow">Nuestro hogar · código {home}</div>
+      <div class="eyebrow">Nuestro hogar · sesión {current_email}</div>
       <h1>{home_name}</h1>
       <div class="couple">
         <span class="dot" style="background:#A9C3AD"></span>{names[0]}
@@ -581,29 +738,85 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.expander("⚙️  Hogar, nombres y cómo invitar"):
-    st.markdown(f"**Código de tu hogar:** `{home}`")
-    st.markdown('<p class="muted">Compartí este código (o copiá el enlace de tu navegador, '
-                "que ya lo incluye) para que otras personas entren a este mismo hogar. "
-                "Cualquiera con el código puede ver y editar los datos.</p>",
-                unsafe_allow_html=True)
-    st.code(f"?home={home}", language=None)
+with st.expander("⚙️  Hogar, usuarios y nombres"):
+    st.markdown(f"**Sesión actual:** `{current_email}`")
+    st.caption("El acceso ahora se recupera con email + PIN. El código queda sólo como identificador interno del hogar.")
+    st.markdown(f"**ID interno del hogar:** `{home}`")
 
     st.markdown("---")
     new_home_name = st.text_input("Nombre del hogar", value=home_name, max_chars=40)
     col_a, col_b = st.columns(2)
     new_a = col_a.text_input("Persona 1", value=names[0], max_chars=24)
     new_b = col_b.text_input("Persona 2", value=names[1], max_chars=24)
-    if st.button("Guardar", type="primary"):
+    if st.button("Guardar nombres", type="primary"):
         set_home_name(home, new_home_name)
         set_config(home, "name_a", new_a.strip() or "Persona 1")
         set_config(home, "name_b", new_b.strip() or "Persona 2")
         st.rerun()
 
     st.markdown("---")
-    if st.button("🚪 Salir / cambiar de hogar"):
+    st.markdown("#### Usuarios con acceso")
+    users = list_home_users(home)
+    if users:
+        for u in users:
+            st.caption(f"• {u['email']}")
+    else:
+        st.caption("Todavía no hay usuarios listados para este hogar.")
+
+    with st.form("add_family_user"):
+        st.markdown("#### Agregar otra persona")
+        st.caption("Creale un acceso con su email y un PIN inicial. Después esa persona entra con esos datos.")
+        invite_email = st.text_input("Email de la otra persona", placeholder="pareja@gmail.com")
+        invite_pin = st.text_input("PIN inicial", type="password", placeholder="Mínimo 4 caracteres")
+        submitted = st.form_submit_button("Agregar acceso", type="primary", use_container_width=True)
+    if submitted:
+        try:
+            status = add_user_to_home(invite_email, invite_pin, home)
+            if status == "already_here":
+                st.info("Ese email ya tiene acceso a este hogar.")
+            else:
+                st.success("Usuario agregado. Ya puede entrar con su email y PIN.")
+                st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    with st.form("change_pin_form"):
+        st.markdown("#### Cambiar mi PIN")
+        c1, c2 = st.columns(2)
+        current_pin = c1.text_input("PIN actual", type="password")
+        new_pin = c2.text_input("PIN nuevo", type="password")
+        submitted = st.form_submit_button("Cambiar PIN")
+    if submitted:
+        try:
+            change_user_pin(current_email, current_pin, new_pin)
+            st.success("PIN actualizado.")
+        except Exception as e:
+            st.error(str(e))
+
+    st.markdown("---")
+    with st.form("move_old_home_form"):
+        st.markdown("#### Vincularme a otro hogar existente")
+        st.caption("Útil si todavía tenés un código viejo con datos cargados.")
+        old_code = st.text_input("Código viejo", max_chars=6, placeholder="Ej: ZEKZJ2")
+        pin = st.text_input("Confirmá tu PIN", type="password", key="settings_move_pin")
+        submitted = st.form_submit_button("Usar ese hogar")
+    if submitted:
+        try:
+            move_user_to_existing_home(current_email, pin, old_code.strip().upper())
+            st.session_state["home"] = old_code.strip().upper()
+            st.success("Ahora tu email entra a ese hogar.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    st.markdown("---")
+    if st.button("🚪 Cerrar sesión"):
         st.session_state.pop("home", None)
-        st.query_params.clear()
+        st.session_state.pop("user_email", None)
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
         st.rerun()
 
 tab_meals, tab_tasks, tab_exp, tab_shop, tab_supp = st.tabs(
