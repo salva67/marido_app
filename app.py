@@ -6,6 +6,7 @@ códigos de hogar ni perder el acceso a los datos cargados.
 """
 
 import datetime
+from decimal import Decimal
 import hashlib
 import hmac
 import io
@@ -407,8 +408,25 @@ def delete_expense(expense_id: str) -> None:
 
 
 # ---------- respaldo ----------
+def _json_safe(value):
+    """Convierte valores devueltos por Postgres/Psycopg a tipos compatibles con JSON."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def export_all(home: str) -> dict:
-    return {
+    data = {
         "version": 3,
         "home_name": get_home_name(home),
         "names": get_names(home),
@@ -418,6 +436,7 @@ def export_all(home: str) -> dict:
         "supplies": get_supplies(home),
         "expenses": get_expenses(home),
     }
+    return _json_safe(data)
 
 
 def import_all(home: str, data: dict) -> None:
@@ -1169,7 +1188,7 @@ with st.expander("💾  Respaldo y descargas — guardá una copia de todo"):
                          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                          use_container_width=True)
     col2.download_button("⬇️ Descargar respaldo (.json)",
-                         data=json.dumps(data, ensure_ascii=False, indent=2),
+                         data=json.dumps(_json_safe(data), ensure_ascii=False, indent=2),
                          file_name=f"respaldo-{home}.json", mime="application/json",
                          use_container_width=True)
     st.markdown("---")
