@@ -1,8 +1,7 @@
-"""Tablero del hogar — app Streamlit multi-hogar (archivo único).
+"""Tablero del hogar — app Streamlit multi-hogar (archivo único, PostgreSQL).
 
-Toda la lógica (datos + interfaz) vive en este único archivo, así no hay
-que mantener dos archivos sincronizados. Cada grupo tiene su propio "hogar"
-identificado por un código corto; no hay login.
+Datos permanentes en Postgres/Supabase. La conexión se toma de los Secrets
+(DATABASE_URL). Todo (datos + interfaz) vive en este único archivo.
 """
 
 import datetime
@@ -10,112 +9,57 @@ import io
 import json
 import os
 import random
-import sqlite3
-import threading
 import uuid
 
 import pandas as pd
+import psycopg
 import streamlit as st
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
-# ===================== CAPA DE DATOS =====================
-DB_PATH = os.environ.get("HOGAR_DB", "hogar.db")
+# ===================== CAPA DE DATOS (PostgreSQL) =====================
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 DAYS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 DAY_SHORT = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 MEAL_SLOTS = [("breakfast", "Desayuno"), ("lunch", "Almuerzo"), ("dinner", "Cena")]
 CATEGORIES = ["Alimentos", "Limpieza", "Otros"]
 LEVELS = {"ok": "Bien", "low": "Poco", "out": "Agotado"}
+EXPENSE_CATS = ["Supermercado", "Servicios", "Hogar", "Salud", "Ocio", "Otros"]
 
-# Alfabeto sin caracteres ambiguos (O/0, I/1) para códigos fáciles de dictar.
 _ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-# DDL de cada tabla, con la columna `home` para aislar por hogar.
-_DDL = {
-    "homes": """
-        CREATE TABLE homes (
-            code    TEXT PRIMARY KEY,
-            name    TEXT NOT NULL DEFAULT 'Mi hogar',
-            created TEXT NOT NULL
-        );""",
-    "config": """
-        CREATE TABLE config (
-            home  TEXT NOT NULL,
-            key   TEXT NOT NULL,
-            value TEXT NOT NULL,
-            PRIMARY KEY (home, key)
-        );""",
-    "meals": """
-        CREATE TABLE meals (
-            home    TEXT    NOT NULL,
-            day     INTEGER NOT NULL,
-            slot    TEXT    NOT NULL,
-            content TEXT    NOT NULL DEFAULT '',
-            PRIMARY KEY (home, day, slot)
-        );""",
-    "tasks": """
-        CREATE TABLE tasks (
-            id        TEXT PRIMARY KEY,
-            home      TEXT    NOT NULL,
-            name      TEXT    NOT NULL,
-            assignee  INTEGER NOT NULL,
-            days      TEXT    NOT NULL DEFAULT '',
-            done_days TEXT    NOT NULL DEFAULT '',
-            created   TEXT    NOT NULL
-        );""",
-    "shopping": """
-        CREATE TABLE shopping (
-            id      TEXT PRIMARY KEY,
-            home    TEXT    NOT NULL,
-            name    TEXT    NOT NULL,
-            cat     TEXT    NOT NULL,
-            done    INTEGER NOT NULL DEFAULT 0,
-            created TEXT    NOT NULL
-        );""",
-    "supplies": """
-        CREATE TABLE supplies (
-            id    TEXT PRIMARY KEY,
-            home  TEXT NOT NULL,
-            name  TEXT NOT NULL,
-            level TEXT NOT NULL DEFAULT 'ok'
-        );""",
-}
-
-_local = threading.local()
+_pool: ConnectionPool | None = None
 
 
-def _conn() -> sqlite3.Connection:
-    if not hasattr(_local, "conn"):
-        _local.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
-        _local.conn.execute("PRAGMA journal_mode=WAL;")
-    return _local.conn
+def configure(url: str) -> None:
+    """Setea la cadena de conexión (la llama la app desde st.secrets)."""
+    global DATABASE_URL, _pool
+    DATABASE_URL = url
+    if _pool is not None:
+        _pool.close()
+        _pool = None
 
 
-def init_db() -> None:
-    c = _conn()
-    for name, ddl in _DDL.items():
-        c.execute(ddl.replace(f"CREATE TABLE {name}", f"CREATE TABLE IF NOT EXISTS {name}"))
-    # Migrar ANTES de crear los índices: una base vieja puede tener tablas sin la
-    # columna `home`, y el índice fallaría. _migrate las recrea con el esquema nuevo.
-    _migrate()
-    c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_home ON tasks(home);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_shop_home ON shopping(home);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_supp_home ON supplies(home);")
-    c.commit()
+def _get_pool() -> ConnectionPool:
+    global _pool
+    if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError("Falta DATABASE_URL (configurá la conexión a Postgres).")
+        _pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5, open=True,
+                               kwargs={"row_factory": dict_row})
+    return _pool
 
 
-def _migrate() -> None:
-    """Si una tabla quedó del esquema viejo (sin columna `home`), la recrea.
-    Evita choques de esquema; sin datos previos, no hace nada."""
-    c = _conn()
-    for name, ddl in _DDL.items():
-        if name == "homes":
-            continue
-        cols = [r["name"] for r in c.execute(f"PRAGMA table_info({name})").fetchall()]
-        if cols and "home" not in cols:
-            c.execute(f"DROP TABLE {name}")
-            c.execute(ddl)
-    c.commit()
+def _run(sql: str, params: tuple = (), fetch: str | None = None):
+    with _get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+    return None
 
 
 def _new_id() -> str:
@@ -130,61 +74,84 @@ def _ints_to_csv(values) -> str:
     return ",".join(str(x) for x in sorted(set(values)))
 
 
+def init_db() -> None:
+    stmts = [
+        """CREATE TABLE IF NOT EXISTS homes (
+            code TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT 'Mi hogar',
+            created TIMESTAMP NOT NULL DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS config (
+            home TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+            PRIMARY KEY (home, key))""",
+        """CREATE TABLE IF NOT EXISTS meals (
+            home TEXT NOT NULL, day INTEGER NOT NULL, slot TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '', PRIMARY KEY (home, day, slot))""",
+        """CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY, home TEXT NOT NULL, name TEXT NOT NULL,
+            assignee INTEGER NOT NULL, days TEXT NOT NULL DEFAULT '',
+            done_days TEXT NOT NULL DEFAULT '', created TIMESTAMP NOT NULL DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS shopping (
+            id TEXT PRIMARY KEY, home TEXT NOT NULL, name TEXT NOT NULL,
+            cat TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
+            created TIMESTAMP NOT NULL DEFAULT NOW())""",
+        """CREATE TABLE IF NOT EXISTS supplies (
+            id TEXT PRIMARY KEY, home TEXT NOT NULL, name TEXT NOT NULL,
+            level TEXT NOT NULL DEFAULT 'ok')""",
+        """CREATE TABLE IF NOT EXISTS expenses (
+            id TEXT PRIMARY KEY, home TEXT NOT NULL, description TEXT NOT NULL,
+            amount DOUBLE PRECISION NOT NULL, payer INTEGER NOT NULL,
+            category TEXT NOT NULL, shared INTEGER NOT NULL DEFAULT 1,
+            date TEXT NOT NULL, created TIMESTAMP NOT NULL DEFAULT NOW())""",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_home ON tasks(home)",
+        "CREATE INDEX IF NOT EXISTS idx_shop_home ON shopping(home)",
+        "CREATE INDEX IF NOT EXISTS idx_supp_home ON supplies(home)",
+        "CREATE INDEX IF NOT EXISTS idx_exp_home ON expenses(home)",
+    ]
+    with _get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            for s in stmts:
+                cur.execute(s)
+
+
 # ---------- hogares ----------
 def _gen_code(n: int = 6) -> str:
+    import random
     return "".join(random.choice(_ALPHABET) for _ in range(n))
 
 
 def home_exists(code: str) -> bool:
     if not code:
         return False
-    row = _conn().execute("SELECT 1 FROM homes WHERE code = ?", (code,)).fetchone()
-    return row is not None
+    return _run("SELECT 1 FROM homes WHERE code = %s", (code,), fetch="one") is not None
 
 
 def create_home(name: str = "") -> str:
-    """Crea un hogar nuevo con código único y devuelve el código."""
-    c = _conn()
     code = _gen_code()
     while home_exists(code):
         code = _gen_code()
-    c.execute(
-        "INSERT INTO homes (code, name, created) VALUES (?, ?, datetime('now'))",
-        (code, name.strip() or "Mi hogar"),
-    )
-    c.execute("INSERT INTO config (home, key, value) VALUES (?, 'name_a', 'Persona 1')", (code,))
-    c.execute("INSERT INTO config (home, key, value) VALUES (?, 'name_b', 'Persona 2')", (code,))
-    c.commit()
+    _run("INSERT INTO homes (code, name) VALUES (%s, %s)", (code, name.strip() or "Mi hogar"))
+    _run("INSERT INTO config (home, key, value) VALUES (%s, 'name_a', 'Persona 1')", (code,))
+    _run("INSERT INTO config (home, key, value) VALUES (%s, 'name_b', 'Persona 2')", (code,))
     return code
 
 
 def get_home_name(code: str) -> str:
-    row = _conn().execute("SELECT name FROM homes WHERE code = ?", (code,)).fetchone()
+    row = _run("SELECT name FROM homes WHERE code = %s", (code,), fetch="one")
     return row["name"] if row else "Mi hogar"
 
 
 def set_home_name(code: str, name: str) -> None:
-    c = _conn()
-    c.execute("UPDATE homes SET name = ? WHERE code = ?", (name.strip() or "Mi hogar", code))
-    c.commit()
+    _run("UPDATE homes SET name = %s WHERE code = %s", (name.strip() or "Mi hogar", code))
 
 
-# ---------- config (nombres de las personas) ----------
+# ---------- config ----------
 def get_config(home: str, key: str):
-    row = _conn().execute(
-        "SELECT value FROM config WHERE home = ? AND key = ?", (home, key)
-    ).fetchone()
+    row = _run("SELECT value FROM config WHERE home = %s AND key = %s", (home, key), fetch="one")
     return row["value"] if row else None
 
 
 def set_config(home: str, key: str, value: str) -> None:
-    c = _conn()
-    c.execute(
-        "INSERT INTO config (home, key, value) VALUES (?, ?, ?) "
-        "ON CONFLICT(home, key) DO UPDATE SET value = excluded.value",
-        (home, key, value),
-    )
-    c.commit()
+    _run("INSERT INTO config (home, key, value) VALUES (%s, %s, %s) "
+         "ON CONFLICT (home, key) DO UPDATE SET value = EXCLUDED.value", (home, key, value))
 
 
 def get_names(home: str) -> list[str]:
@@ -194,9 +161,7 @@ def get_names(home: str) -> list[str]:
 
 # ---------- meals ----------
 def get_meals(home: str) -> dict:
-    rows = _conn().execute(
-        "SELECT day, slot, content FROM meals WHERE home = ?", (home,)
-    ).fetchall()
+    rows = _run("SELECT day, slot, content FROM meals WHERE home = %s", (home,), fetch="all") or []
     data = {d: {slot: "" for slot, _ in MEAL_SLOTS} for d in range(len(DAYS))}
     for r in rows:
         if r["day"] in data:
@@ -205,26 +170,18 @@ def get_meals(home: str) -> dict:
 
 
 def set_meal(home: str, day: int, slot: str, content: str) -> None:
-    c = _conn()
-    c.execute(
-        "INSERT INTO meals (home, day, slot, content) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(home, day, slot) DO UPDATE SET content = excluded.content",
-        (home, day, slot, content),
-    )
-    c.commit()
+    _run("INSERT INTO meals (home, day, slot, content) VALUES (%s, %s, %s, %s) "
+         "ON CONFLICT (home, day, slot) DO UPDATE SET content = EXCLUDED.content",
+         (home, day, slot, content))
 
 
 def clear_meals(home: str) -> None:
-    c = _conn()
-    c.execute("DELETE FROM meals WHERE home = ?", (home,))
-    c.commit()
+    _run("DELETE FROM meals WHERE home = %s", (home,))
 
 
-# ---------- tasks (planificación semanal) ----------
+# ---------- tasks ----------
 def get_tasks(home: str) -> list[dict]:
-    rows = _conn().execute(
-        "SELECT * FROM tasks WHERE home = ? ORDER BY created ASC", (home,)
-    ).fetchall()
+    rows = _run("SELECT * FROM tasks WHERE home = %s ORDER BY created ASC", (home,), fetch="all") or []
     out = []
     for r in rows:
         d = dict(r)
@@ -235,165 +192,134 @@ def get_tasks(home: str) -> list[dict]:
 
 
 def add_task(home: str, name: str, assignee: int, days) -> None:
-    c = _conn()
-    c.execute(
-        "INSERT INTO tasks (id, home, name, assignee, days, done_days, created) "
-        "VALUES (?, ?, ?, ?, ?, '', datetime('now'))",
-        (_new_id(), home, name, assignee, _ints_to_csv(days)),
-    )
-    c.commit()
+    _run("INSERT INTO tasks (id, home, name, assignee, days, done_days) "
+         "VALUES (%s, %s, %s, %s, %s, '')",
+         (_new_id(), home, name, assignee, _ints_to_csv(days)))
 
 
 def toggle_task_day(task_id: str, day: int) -> None:
-    c = _conn()
-    row = c.execute("SELECT done_days FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = _run("SELECT done_days FROM tasks WHERE id = %s", (task_id,), fetch="one")
     if not row:
         return
     done = set(_csv_to_ints(row["done_days"] or ""))
     done.discard(day) if day in done else done.add(day)
-    c.execute("UPDATE tasks SET done_days = ? WHERE id = ?", (_ints_to_csv(done), task_id))
-    c.commit()
+    _run("UPDATE tasks SET done_days = %s WHERE id = %s", (_ints_to_csv(done), task_id))
 
 
 def delete_task(task_id: str) -> None:
-    c = _conn()
-    c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-    c.commit()
+    _run("DELETE FROM tasks WHERE id = %s", (task_id,))
 
 
 def reset_week(home: str) -> None:
-    c = _conn()
-    c.execute("UPDATE tasks SET done_days = '' WHERE home = ?", (home,))
-    c.commit()
+    _run("UPDATE tasks SET done_days = '' WHERE home = %s", (home,))
 
 
 # ---------- shopping ----------
 def get_shopping(home: str) -> list[dict]:
-    rows = _conn().execute(
-        "SELECT * FROM shopping WHERE home = ? ORDER BY created ASC", (home,)
-    ).fetchall()
-    return [dict(r) for r in rows]
+    return _run("SELECT * FROM shopping WHERE home = %s ORDER BY created ASC", (home,), fetch="all") or []
 
 
 def add_shopping(home: str, name: str, cat: str) -> None:
-    c = _conn()
-    c.execute(
-        "INSERT INTO shopping (id, home, name, cat, done, created) "
-        "VALUES (?, ?, ?, ?, 0, datetime('now'))",
-        (_new_id(), home, name, cat),
-    )
-    c.commit()
+    _run("INSERT INTO shopping (id, home, name, cat, done) VALUES (%s, %s, %s, %s, 0)",
+         (_new_id(), home, name, cat))
 
 
 def toggle_shopping(item_id: str) -> None:
-    c = _conn()
-    c.execute("UPDATE shopping SET done = 1 - done WHERE id = ?", (item_id,))
-    c.commit()
+    _run("UPDATE shopping SET done = 1 - done WHERE id = %s", (item_id,))
 
 
 def delete_shopping(item_id: str) -> None:
-    c = _conn()
-    c.execute("DELETE FROM shopping WHERE id = ?", (item_id,))
-    c.commit()
+    _run("DELETE FROM shopping WHERE id = %s", (item_id,))
 
 
 def clear_bought(home: str) -> None:
-    c = _conn()
-    c.execute("DELETE FROM shopping WHERE home = ? AND done = 1", (home,))
-    c.commit()
+    _run("DELETE FROM shopping WHERE home = %s AND done = 1", (home,))
 
 
 def shopping_has(home: str, name: str) -> bool:
-    row = _conn().execute(
-        "SELECT 1 FROM shopping WHERE home = ? AND LOWER(name) = LOWER(?) LIMIT 1",
-        (home, name),
-    ).fetchone()
-    return row is not None
+    return _run("SELECT 1 FROM shopping WHERE home = %s AND LOWER(name) = LOWER(%s) LIMIT 1",
+                (home, name), fetch="one") is not None
 
 
 # ---------- supplies ----------
 def get_supplies(home: str) -> list[dict]:
-    rows = _conn().execute(
-        "SELECT * FROM supplies WHERE home = ? ORDER BY name COLLATE NOCASE", (home,)
-    ).fetchall()
-    return [dict(r) for r in rows]
+    return _run("SELECT * FROM supplies WHERE home = %s ORDER BY LOWER(name)", (home,), fetch="all") or []
 
 
 def add_supply(home: str, name: str) -> None:
-    c = _conn()
-    c.execute("INSERT INTO supplies (id, home, name, level) VALUES (?, ?, ?, 'ok')",
-              (_new_id(), home, name))
-    c.commit()
+    _run("INSERT INTO supplies (id, home, name, level) VALUES (%s, %s, %s, 'ok')",
+         (_new_id(), home, name))
 
 
 def set_level(supply_id: str, level: str) -> None:
-    c = _conn()
-    c.execute("UPDATE supplies SET level = ? WHERE id = ?", (level, supply_id))
-    c.commit()
+    _run("UPDATE supplies SET level = %s WHERE id = %s", (level, supply_id))
 
 
 def delete_supply(supply_id: str) -> None:
-    c = _conn()
-    c.execute("DELETE FROM supplies WHERE id = ?", (supply_id,))
-    c.commit()
+    _run("DELETE FROM supplies WHERE id = %s", (supply_id,))
 
 
-# ---------- respaldo / exportación (por hogar) ----------
+# ---------- expenses ----------
+def get_expenses(home: str) -> list[dict]:
+    return _run("SELECT * FROM expenses WHERE home = %s ORDER BY date DESC, created DESC",
+                (home,), fetch="all") or []
+
+
+def add_expense(home: str, description: str, amount: float, payer: int,
+                category: str, shared: bool, date: str) -> None:
+    _run("INSERT INTO expenses (id, home, description, amount, payer, category, shared, date) "
+         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+         (_new_id(), home, description, float(amount), int(payer), category,
+          1 if shared else 0, date))
+
+
+def delete_expense(expense_id: str) -> None:
+    _run("DELETE FROM expenses WHERE id = %s", (expense_id,))
+
+
+# ---------- respaldo ----------
 def export_all(home: str) -> dict:
     return {
-        "version": 2,
+        "version": 3,
         "home_name": get_home_name(home),
         "names": get_names(home),
         "meals": get_meals(home),
         "tasks": get_tasks(home),
         "shopping": get_shopping(home),
         "supplies": get_supplies(home),
+        "expenses": get_expenses(home),
     }
 
 
 def import_all(home: str, data: dict) -> None:
-    """Reemplaza los datos del hogar indicado con los del respaldo."""
-    c = _conn()
-    cur = c.cursor()
-    cur.execute("DELETE FROM meals WHERE home = ?", (home,))
-    cur.execute("DELETE FROM tasks WHERE home = ?", (home,))
-    cur.execute("DELETE FROM shopping WHERE home = ?", (home,))
-    cur.execute("DELETE FROM supplies WHERE home = ?", (home,))
-
+    for tbl in ("meals", "tasks", "shopping", "supplies", "expenses"):
+        _run(f"DELETE FROM {tbl} WHERE home = %s", (home,))
     if data.get("home_name"):
         set_home_name(home, str(data["home_name"]))
     names = data.get("names") or ["Persona 1", "Persona 2"]
     set_config(home, "name_a", str(names[0]))
     set_config(home, "name_b", str(names[1]))
-
     for day_key, slots in (data.get("meals") or {}).items():
-        day = int(day_key)
         for slot, content in (slots or {}).items():
             if content:
-                cur.execute(
-                    "INSERT OR REPLACE INTO meals (home, day, slot, content) VALUES (?, ?, ?, ?)",
-                    (home, day, slot, str(content)),
-                )
+                set_meal(home, int(day_key), slot, str(content))
     for t in data.get("tasks") or []:
-        cur.execute(
-            "INSERT INTO tasks (id, home, name, assignee, days, done_days, created) "
-            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
-            (_new_id(), home, str(t.get("name", "")), int(t.get("assignee", 0)),
-             _ints_to_csv(t.get("days") or []), _ints_to_csv(t.get("done_days") or [])),
-        )
+        _run("INSERT INTO tasks (id, home, name, assignee, days, done_days) "
+             "VALUES (%s, %s, %s, %s, %s, %s)",
+             (_new_id(), home, str(t.get("name", "")), int(t.get("assignee", 0)),
+              _ints_to_csv(t.get("days") or []), _ints_to_csv(t.get("done_days") or [])))
     for s in data.get("shopping") or []:
-        cur.execute(
-            "INSERT INTO shopping (id, home, name, cat, done, created) "
-            "VALUES (?, ?, ?, ?, ?, datetime('now'))",
-            (_new_id(), home, str(s.get("name", "")), str(s.get("cat", "Otros")),
-             int(s.get("done", 0))),
-        )
+        _run("INSERT INTO shopping (id, home, name, cat, done) VALUES (%s, %s, %s, %s, %s)",
+             (_new_id(), home, str(s.get("name", "")), str(s.get("cat", "Otros")), int(s.get("done", 0))))
     for s in data.get("supplies") or []:
-        cur.execute(
-            "INSERT INTO supplies (id, home, name, level) VALUES (?, ?, ?, ?)",
-            (_new_id(), home, str(s.get("name", "")), str(s.get("level", "ok"))),
-        )
-    c.commit()
+        _run("INSERT INTO supplies (id, home, name, level) VALUES (%s, %s, %s, %s)",
+             (_new_id(), home, str(s.get("name", "")), str(s.get("level", "ok"))))
+    for e in data.get("expenses") or []:
+        _run("INSERT INTO expenses (id, home, description, amount, payer, category, shared, date) "
+             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+             (_new_id(), home, str(e.get("description", "")), float(e.get("amount", 0)),
+              int(e.get("payer", 0)), str(e.get("category", "Otros")),
+              int(e.get("shared", 1)), str(e.get("date", ""))))
 
 
 # ===================== APLICACIÓN =====================
@@ -404,6 +330,17 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# --- Conexión a la base permanente (Postgres / Supabase) ---
+try:
+    _db_url = st.secrets.get("DATABASE_URL", "")
+except Exception:
+    _db_url = ""
+_db_url = _db_url or os.environ.get("DATABASE_URL", "")
+if not _db_url:
+    st.error("⚠️ Falta configurar la conexión a la base de datos. "
+             "Agregá DATABASE_URL en los Secrets de la app (ver README).")
+    st.stop()
+configure(_db_url)
 init_db()
 
 
@@ -445,7 +382,75 @@ def build_excel(data: dict) -> bytes:
                    for s in data["supplies"]]
         pd.DataFrame(insumos or [{"Insumo": "", "Nivel": ""}]
                      ).to_excel(xl, sheet_name="Insumos", index=False)
+
+        gastos = [{"Fecha": e["date"], "Descripción": e["description"],
+                   "Monto": e["amount"], "Categoría": e["category"],
+                   "Pagó": nombres[e["payer"]],
+                   "Compartido": "Sí" if e["shared"] else "No"}
+                  for e in data.get("expenses", [])]
+        pd.DataFrame(gastos or [{"Fecha": "", "Descripción": "", "Monto": "",
+                                 "Categoría": "", "Pagó": "", "Compartido": ""}]
+                     ).to_excel(xl, sheet_name="Gastos", index=False)
     return buf.getvalue()
+
+
+def _ics_escape(text: str) -> str:
+    return (text.replace("\\", "\\\\").replace(";", "\\;")
+            .replace(",", "\\,").replace("\n", "\\n"))
+
+
+def build_ics(home: str) -> str:
+    """Genera un calendario .ics con las tareas y comidas de la semana en curso,
+    listo para importar en Google Calendar (u otro calendario)."""
+    tasks = get_tasks(home)
+    meals = get_meals(home)
+    nombres = get_names(home)
+    today = datetime.date.today()
+    monday = today - datetime.timedelta(days=today.weekday())
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0",
+             "PRODID:-//Tablero del hogar//ES", "CALSCALE:GREGORIAN"]
+
+    # Tareas: eventos de día completo en el día asignado de la semana actual.
+    for t in tasks:
+        quien = "Ambos" if t["assignee"] == -1 else nombres[t["assignee"]]
+        for d in t["days"]:
+            day = monday + datetime.timedelta(days=d)
+            ymd = day.strftime("%Y%m%d")
+            nxt = (day + datetime.timedelta(days=1)).strftime("%Y%m%d")
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:task-{t['id']}-{d}-{home}@hogar",
+                f"DTSTAMP:{stamp}",
+                f"DTSTART;VALUE=DATE:{ymd}",
+                f"DTEND;VALUE=DATE:{nxt}",
+                f"SUMMARY:{_ics_escape('🧹 ' + t['name'] + ' (' + quien + ')')}",
+                "END:VEVENT",
+            ]
+
+    # Comidas: eventos con horario.
+    horarios = {"breakfast": ("0800", "0830", "Desayuno"),
+                "lunch": ("1300", "1400", "Almuerzo"),
+                "dinner": ("2100", "2200", "Cena")}
+    for d in range(7):
+        day = monday + datetime.timedelta(days=d)
+        ymd = day.strftime("%Y%m%d")
+        for slot, (h1, h2, lbl) in horarios.items():
+            content = meals[d][slot]
+            if content:
+                lines += [
+                    "BEGIN:VEVENT",
+                    f"UID:meal-{d}-{slot}-{home}@hogar",
+                    f"DTSTAMP:{stamp}",
+                    f"DTSTART:{ymd}T{h1}00",
+                    f"DTEND:{ymd}T{h2}00",
+                    f"SUMMARY:{_ics_escape('🍽️ ' + lbl + ': ' + content)}",
+                    "END:VEVENT",
+                ]
+
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines)
 
 
 # ---------------------------------------------------------------- estilos
@@ -585,8 +590,8 @@ with st.expander("⚙️  Hogar, nombres y cómo invitar"):
         st.query_params.clear()
         st.rerun()
 
-tab_meals, tab_tasks, tab_shop, tab_supp = st.tabs(
-    ["🍽️ Comidas", "🧹 Tareas", "🛒 Compras", "📦 Insumos"]
+tab_meals, tab_tasks, tab_exp, tab_shop, tab_supp = st.tabs(
+    ["🍽️ Comidas", "🧹 Tareas", "💰 Gastos", "🛒 Compras", "📦 Insumos"]
 )
 
 
@@ -714,6 +719,106 @@ with tab_tasks:
                     st.rerun()
 
 
+# ================================================================ GASTOS
+_MESES = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+          "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+
+
+def money(x: float) -> str:
+    return f"${x:,.2f}"
+
+
+def month_label(ym: str) -> str:
+    try:
+        y, m = ym.split("-")
+        return f"{_MESES[int(m)].capitalize()} {y}"
+    except Exception:
+        return ym
+
+
+with tab_exp:
+    st.subheader("Cuentas y gastos")
+    st.markdown('<p class="muted">Registrá quién pagó qué. Abajo ves el balance, '
+                "los gráficos por categoría y la evolución mes a mes.</p>",
+                unsafe_allow_html=True)
+
+    with st.form("add_expense", clear_on_submit=True):
+        e_desc = st.text_input("Descripción", placeholder="Súper, luz, farmacia…")
+        c1, c2 = st.columns(2)
+        e_amount = c1.number_input("Monto", min_value=0.0, step=100.0, format="%.2f")
+        e_date = c2.date_input("Fecha", value=datetime.date.today())
+        c3, c4 = st.columns(2)
+        e_payer = c3.selectbox("¿Quién pagó?", options=[0, 1], format_func=lambda i: names[i])
+        e_cat = c4.selectbox("Categoría", EXPENSE_CATS)
+        e_shared = st.checkbox("Gasto compartido (se divide entre los dos)", value=True)
+        if st.form_submit_button("Agregar gasto", type="primary", use_container_width=True):
+            if e_desc.strip() and e_amount > 0:
+                add_expense(home, e_desc.strip(), e_amount, e_payer, e_cat,
+                               e_shared, e_date.isoformat())
+                st.rerun()
+            else:
+                st.warning("Completá descripción y un monto mayor a 0.")
+
+    expenses = get_expenses(home)
+    if not expenses:
+        st.info("Todavía no hay gastos cargados. Agregá el primero arriba.")
+    else:
+        df = pd.DataFrame(expenses)
+        df["mes"] = df["date"].str.slice(0, 7)
+
+        # --- filtro de mes ---
+        meses = sorted(df["mes"].unique(), reverse=True)
+        hoy_mes = datetime.date.today().strftime("%Y-%m")
+        opciones = ["Todos"] + meses
+        idx_def = opciones.index(hoy_mes) if hoy_mes in opciones else 0
+        sel = st.selectbox("Período", opciones,
+                           index=idx_def, format_func=lambda x: "Todos los meses" if x == "Todos" else month_label(x))
+        view = df if sel == "Todos" else df[df["mes"] == sel]
+
+        # --- métricas y balance ---
+        total = view["amount"].sum()
+        comp = view[view["shared"] == 1]
+        paid_a = comp[comp["payer"] == 0]["amount"].sum()
+        paid_b = comp[comp["payer"] == 1]["amount"].sum()
+        share = (paid_a + paid_b) / 2
+        diff = paid_a - share
+
+        m1, m2 = st.columns(2)
+        m1.metric(f"Total {'' if sel=='Todos' else month_label(sel).lower()}".strip(), money(total))
+        if abs(diff) < 0.01:
+            m2.metric("Balance", "Están a mano 👍")
+        elif diff > 0:
+            m2.metric("Balance", money(diff), delta=f"{names[1]} le debe a {names[0]}", delta_color="off")
+        else:
+            m2.metric("Balance", money(-diff), delta=f"{names[0]} le debe a {names[1]}", delta_color="off")
+
+        st.caption(f"Compartido — {names[0]} puso {money(paid_a)} · {names[1]} puso {money(paid_b)}")
+
+        # --- gráfico por categoría ---
+        st.markdown("##### Gasto por categoría")
+        by_cat = view.groupby("category")["amount"].sum().sort_values(ascending=False)
+        st.bar_chart(by_cat, color="#4A6B52", horizontal=True)
+
+        # --- evolución mensual (siempre sobre todo el historial) ---
+        st.markdown("##### Evolución por mes")
+        by_month = df.groupby("mes")["amount"].sum().sort_index()
+        by_month.index = [month_label(m) for m in by_month.index]
+        st.bar_chart(by_month, color="#C0744F")
+
+        # --- lista de gastos del período ---
+        st.markdown("##### Detalle")
+        for e in view.to_dict("records"):
+            col_info, col_amt, col_del = st.columns([6, 3, 1])
+            etiqueta = "" if e["shared"] else " · personal"
+            col_info.markdown(f"**{e['description']}**  \n"
+                              f"<span class='muted'>{e['date']} · {e['category']} · pagó {names[e['payer']]}{etiqueta}</span>",
+                              unsafe_allow_html=True)
+            col_amt.markdown(f"**{money(e['amount'])}**")
+            if col_del.button("🗑", key=f"delexp_{e['id']}", help="Eliminar gasto"):
+                delete_expense(e["id"])
+                st.rerun()
+
+
 # ================================================================ COMPRAS
 with tab_shop:
     st.subheader("Lista de compras")
@@ -805,6 +910,25 @@ with tab_supp:
 
 # ================================================================ RESPALDO
 st.divider()
+with st.expander("📅  Google Calendar — llevá tu semana al calendario"):
+    st.markdown('<p class="muted">Descargá la semana en curso (tareas y comidas) como archivo '
+                "<code>.ics</code> e importalo a Google Calendar. La sincronización automática "
+                "vendrá más adelante.</p>", unsafe_allow_html=True)
+    st.download_button(
+        "⬇️ Descargar semana (.ics)",
+        data=build_ics(home),
+        file_name=f"semana-{home}.ics",
+        mime="text/calendar",
+        use_container_width=True,
+    )
+    st.markdown("**Cómo importarlo en Google Calendar:**")
+    st.markdown(
+        "1. Abrí Google Calendar en la computadora.\n"
+        "2. Engranaje ⚙️ → **Configuración** → **Importar y exportar**.\n"
+        "3. Seleccioná el archivo `.ics` que descargaste y elegí en qué calendario cargarlo.\n"
+        "4. **Importar**. Las tareas y comidas de esta semana aparecen como eventos."
+    )
+
 with st.expander("💾  Respaldo y descargas — guardá una copia de todo"):
     st.markdown('<p class="muted">En Streamlit Cloud los datos pueden borrarse cuando la app se '
                 "reinicia. Descargá un respaldo cada tanto; si perdés los datos, lo volvés a cargar acá. "

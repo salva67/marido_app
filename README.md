@@ -1,83 +1,45 @@
-# 🏡 Tablero del hogar (multi-hogar)
+# 🏡 Tablero del hogar — versión PostgreSQL (datos permanentes)
 
-App en Streamlit para organizar la rutina del hogar: comidas de la semana,
-limpieza y tareas (con planificación semanal), lista de compras e inventario
-de insumos. Cuando un insumo queda en *poco* o *agotado*, se manda a la lista
-de compras con un clic.
+App Streamlit multi-hogar en un solo archivo (`app.py`), con los datos guardados
+en **PostgreSQL (Supabase)**. Ya no se pierden en los redeploys.
 
-## Cómo funciona el multi-hogar (sin login)
+## Qué cambió
+- Antes los datos vivían en SQLite (disco efímero de Streamlit Cloud).
+- Ahora viven en Postgres/Supabase: **permanentes**.
+- La app NO arranca hasta que configures la conexión (`DATABASE_URL`).
 
-Cada grupo tiene su propio **hogar**, identificado por un código corto de 6
-caracteres (ej. `ZEKZJ2`). Al abrir la app:
+## Paso 1 — Crear la base en Supabase (gratis)
+1. Entrá a https://supabase.com y creá una cuenta.
+2. **New project**: elegí un nombre, una **contraseña de base de datos** (guardala)
+   y una región cercana. Esperá 1-2 minutos a que se cree.
+3. En el proyecto: **Connect** (arriba) o **Settings → Database → Connection string**.
+   Copiá la cadena en formato **URI**. Se ve así:
+   `postgresql://postgres:[YOUR-PASSWORD]@db.xxxxxxxx.supabase.co:5432/postgres`
+4. Reemplazá `[YOUR-PASSWORD]` por la contraseña que pusiste en el paso 2.
 
-- **Crear un hogar nuevo** genera un código y entra a ese espacio.
-- **Entrar con código** te lleva a un hogar existente.
+## Paso 2 — Cargar la conexión en Streamlit Cloud
+1. En tu app: **Manage app → Settings → Secrets**.
+2. Pegá esta línea (con tu cadena real) y guardá:
+   ```
+   DATABASE_URL = "postgresql://postgres:TU_PASSWORD@db.xxxxxxxx.supabase.co:5432/postgres"
+   ```
+3. La app se reinicia y **crea las tablas sola** en el primer arranque.
 
-El código viaja en la URL (`...?home=ZEKZJ2`), así que compartir el enlace del
-navegador es suficiente para que otras personas entren al **mismo** hogar y
-vean/editen los mismos datos. Los datos de cada hogar están aislados: un hogar
-nunca ve los de otro.
+## Paso 3 — Subir el código
+Subí `app.py` y `requirements.txt` (tiene la nueva dependencia `psycopg`).
+Si tenés un `db.py` viejo en el repo, borralo.
 
-> **Privacidad:** no hay contraseña. Cualquiera con el código (o el enlace)
-> puede entrar a ese hogar, igual que un documento compartido por link. El
-> código de 6 caracteres es difícil de adivinar, pero no lo publiques.
-
-## Estructura
-
-```
-hogar-app/
-├── app.py              # interfaz Streamlit + pantalla de ingreso por código
-├── db.py               # capa de datos (SQLite), aislada por hogar
-├── requirements.txt
-├── .streamlit/config.toml
-└── .gitignore
-```
-
-## Correr en tu computadora
-
+## Correr local (opcional)
+Creá `.streamlit/secrets.toml` con tu `DATABASE_URL` (ver `secrets.toml.example`)
+o exportá la variable de entorno, y:
 ```bash
-cd hogar-app
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-La base `hogar.db` se crea sola. Para otra ubicación, usá `HOGAR_DB`:
-
-```bash
-HOGAR_DB=/data/hogar.db streamlit run app.py
-```
-
-## Deploy y el tema de los varios hogares a la vez
-
-La separación por hogar ya está lista en el código y funciona con cualquier
-motor. Lo que cambia según dónde lo deploees es **dónde viven los datos**:
-
-### Streamlit Community Cloud (rápido, para probar)
-Subí el repo a GitHub y conectalo en https://share.streamlit.io.
-**Limitación:** el disco es efímero y de una sola instancia. La app corre y el
-multi-hogar funciona, pero `hogar.db` se reinicia en cada redeploy y SQLite no
-está pensado para mucha escritura concurrente. Sirve para que pocas personas
-prueben; usá el respaldo `.json` para no perder datos.
-
-### Host con disco persistente (Railway / Render / Fly.io)
-Mismo código, montás un volumen y apuntás `HOGAR_DB` a una ruta dentro de él
-(ej. `/data/hogar.db`). Los datos sobreviven a los reinicios. SQLite con WAL
-aguanta bien varios hogares con pocas personas cada uno.
-
-### Base gestionada (recomendado para varios hogares en serio)
-Para muchos hogares y personas escribiendo a la vez, conviene **PostgreSQL**
-(por ejemplo Supabase, gratis). Toda la persistencia está aislada en `db.py`,
-así que sólo se reescribe ese archivo (mismas funciones, motor Postgres) y
-`app.py` no cambia. Pedímelo y te paso esa versión.
-
 ## Notas
-
-- La app relee la base en cada interacción: si dos personas del mismo hogar la
-  usan a la vez, cada una ve los cambios de la otra al interactuar o refrescar
-  (Streamlit no actualiza en tiempo real por sí solo).
-- Cada hogar tiene su propio respaldo descargable (Excel y JSON) desde
-  "Respaldo y descargas".
-- Las tareas se agendan por día de la semana y "Empezar nueva semana" las
-  desmarca sin borrarlas.
+- `.gitignore` ya excluye `secrets.toml` para que **no subas tus credenciales**.
+- Si Supabase te muestra varias opciones de conexión, empezá con la **directa**
+  (puerto 5432). Si tu hosting limita conexiones, usá el **pooler** (puerto 6543).
+- El login con Google y la sincronización con Google Calendar son los próximos
+  pasos: se montan sobre esta base permanente.
